@@ -1,0 +1,59 @@
+# Original project excluded/generated directories
+test_benches/verilator/build/
+vivado/
+
+# VCS / Verilator / simulation artifacts
+simv
+simv.*/
+simv.daidir/
+simv.vdb/
+*.vdb/
+*.daidir/
+csrc/
+sim_src/
+coverage_report/
+coverage_report_*/
+waves/
+logs/
+build*/
+*.vpd
+*.vcd
+*.fsdb
+*.wlf
+*.shm
+*.trn
+*.dsn
+*.rc
+*.log
+*.o
+*.a
+*.so
+*.d
+ucli.key
+verdi_config_file
+novas.conf
+novas.rc
+DVEfiles/
+
+# Local editor/language-server configuration
+.slang/
+.vscode/
+.vscode-server/
+.idea/
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+# Third-party tool documentation and accidental generated files
+verification/vcs_md/
+vcs_help.txt
+*_help_V-*.txt
+core/common_components/zero=0,
+
+*.fsm.sch.verilog.xml

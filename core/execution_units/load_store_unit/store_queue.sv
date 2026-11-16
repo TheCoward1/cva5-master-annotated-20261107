@@ -1,0 +1,350 @@
+// ============================================================================
+// 文件：core/execution_units/load_store_unit/store_queue.sv
+// 类型：module
+// 名称：store_queue
+// 作用：管理 store 指令的入队、提交、写回和地址数据顺序。
+// 编码：UTF-8
+// 说明：本文件为中文注释备份，代码逻辑与原版保持一致。
+// ============================================================================
+
+/*
+ * Copyright © 2020 Eric Matthews,  Lesley Shannon
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Initial code developed under the supervision of Dr. Lesley Shannon,
+ * Reconfigurable Computing Lab, Simon Fraser University.
+ *
+ * Author(s):
+ *             Eric Matthews <ematthew@sfu.ca>
+ */
+
+module store_queue // 定义 store_queue 模块。
+
+    import cva5_config::*; // 导入包或命名空间：cva5_config::*;。
+    import riscv_types::*; // 导入包或命名空间：riscv_types::*;。
+    import cva5_types::*; // 导入包或命名空间：cva5_types::*;。
+
+    # (
+        parameter cpu_config_t CONFIG = EXAMPLE_CONFIG // 声明可配置参数。
+    )
+    (
+        input logic clk, // 声明输入端口。
+        input logic rst, // 声明输入端口。
+
+        store_queue_interface.queue sq,
+        input logic [$clog2(CONFIG.NUM_WB_GROUPS)-1:0] store_forward_wb_group, // 声明输入端口。
+        input logic [1:0] fp_store_forward_wb_group, // 声明输入端口。
+
+        //Address hash (shared by loads and stores)
+        input addr_hash_t addr_hash, // 声明输入端口。
+
+        //hash check on adding a load to the queue
+        output logic [$clog2(CONFIG.SQ_DEPTH)-1:0] sq_index, // 声明输出端口。
+        output logic [$clog2(CONFIG.SQ_DEPTH)-1:0] sq_oldest, // 声明输出端口。
+        output logic potential_store_conflict, // 声明输出端口。
+
+        //Writeback snooping
+        input wb_packet_t wb_packet [CONFIG.NUM_WB_GROUPS], // 声明输入端口。
+        input fp_wb_packet_t fp_wb_packet [2], // 声明输入端口。
+
+        //Retire
+        input retire_packet_t store_retire // 声明输入端口。
+    );
+
+    localparam FINAL_TABLE_WIDTH = CONFIG.INCLUDE_UNIT.FPU && FLEN > 32 ? FLEN : 32; // 声明局部常量。
+    localparam LOG2_SQ_DEPTH = $clog2(CONFIG.SQ_DEPTH); // 声明局部常量。
+    localparam NUM_OF_FORWARDING_PORTS = CONFIG.NUM_WB_GROUPS - 1; // 声明局部常量。
+// 定义类型别名或枚举/结构类型。
+    typedef logic [LOG2_SQ_DEPTH-1:0] sq_index_t;
+
+// 定义类型别名或枚举/结构类型。
+    typedef struct packed {
+        id_t id_needed;
+        logic [$clog2(CONFIG.NUM_WB_GROUPS)-1:0] wb_group; // 声明信号、变量或生成变量。
+        logic [1:0] fp_wb_group; // 声明信号、变量或生成变量。
+        logic fp; // 声明信号、变量或生成变量。
+        sq_index_t sq_index;
+    } retire_table_t;
+    retire_table_t retire_table_out;
+
+    wb_packet_t wb_snoop [CONFIG.NUM_WB_GROUPS];
+    fp_wb_packet_t fp_wb_snoop [2];
+
+    //Register-based memory blocks
+    logic [CONFIG.SQ_DEPTH-1:0] valid; // 声明信号、变量或生成变量。
+    logic [CONFIG.SQ_DEPTH-1:0] valid_next; // 声明信号、变量或生成变量。
+    addr_hash_t [CONFIG.SQ_DEPTH-1:0] hashes;
+    logic [CONFIG.SQ_DEPTH-1:0] ids_valid; // 声明信号、变量或生成变量。
+    id_t [CONFIG.SQ_DEPTH-1:0] ids;
+
+    //LUTRAM-based memory blocks
+    sq_entry_t output_entry;
+    sq_entry_t output_entry_r;
+    logic [1:0] retire_alignment; // 声明信号、变量或生成变量。
+
+    sq_index_t sq_index_next;
+    sq_index_t sq_oldest_next;
+    logic [LOG2_SQ_DEPTH:0] released_count; // 声明信号、变量或生成变量。
+
+    logic [CONFIG.SQ_DEPTH-1:0] new_request_one_hot; // 声明信号、变量或生成变量。
+    logic [CONFIG.SQ_DEPTH-1:0] issued_one_hot; // 声明信号、变量或生成变量。
+
+    logic [31:0] data_pre_alignment; // 声明信号、变量或生成变量。
+    logic [31:0] marshalled_data; // 声明信号、变量或生成变量。
+    logic [FLEN-1:0] fp_marshalled_data; // 声明信号、变量或生成变量。
+    logic [FINAL_TABLE_WIDTH-1:0] sq_data_in; // 声明信号、变量或生成变量。
+    logic [FINAL_TABLE_WIDTH-1:0] sq_data_out; // 声明信号、变量或生成变量。
+    ////////////////////////////////////////////////////
+    //Implementation     
+
+    //Store Queue indicies
+    assign sq_index_next = sq_index + LOG2_SQ_DEPTH'(sq.push); // 执行连续赋值，把组合逻辑连接到目标信号。
+    assign sq_oldest_next = sq_oldest + LOG2_SQ_DEPTH'(sq.pop); // 执行连续赋值，把组合逻辑连接到目标信号。
+
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        if (rst) begin // 执行条件判断，满足条件时进入对应分支。
+            sq_index <= 0;
+            sq_oldest <= 0;
+        end else begin // 结束语句块。
+            sq_index <= sq_index_next;
+            sq_oldest <= sq_oldest_next;
+        end // 结束语句块。
+    end // 结束语句块。
+
+    assign new_request_one_hot = CONFIG.SQ_DEPTH'(sq.push) << sq_index; // 执行连续赋值，把组合逻辑连接到目标信号。
+    assign issued_one_hot = CONFIG.SQ_DEPTH'(sq.pop) << sq_oldest; // 执行连续赋值，把组合逻辑连接到目标信号。
+
+    assign valid_next = (valid | new_request_one_hot) & ~issued_one_hot; // 执行连续赋值，把组合逻辑连接到目标信号。
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        if (rst) begin // 执行条件判断，满足条件时进入对应分支。
+            valid <= '0;
+            sq.full <= 0;
+        end else begin // 结束语句块。
+            valid <= valid_next;
+            sq.full <= &valid_next;
+        end // 结束语句块。
+    end // 结束语句块。
+    assign sq.empty = ~|valid; // 执行连续赋值，把组合逻辑连接到目标信号。
+
+    //SQ attributes and issue data
+    lutram_1w_1r #(.DATA_TYPE(sq_entry_t), .DEPTH(CONFIG.SQ_DEPTH))
+    store_attr (
+        .clk(clk),
+        .waddr(sq_index),
+        .raddr(sq_oldest_next),
+        .ram_write(sq.push),
+        .new_ram_data('{
+            offset : sq.data_in.offset,
+            be : sq.data_in.be,
+            cache_op : sq.data_in.cache_op,
+            data : '0,
+            fp : sq.data_in.fp,
+            double : sq.data_in.double,
+            fp_data : '0
+        }),
+        .ram_data_out(output_entry)
+    );
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        output_entry_r <= output_entry;
+    end // 结束语句块。
+
+    lutram_1w_1r #(.DATA_TYPE(logic[1:0]), .DEPTH(MAX_IDS))
+    store_alignment (
+        .clk(clk),
+        .waddr(sq.data_in.id),
+        .raddr(store_retire.id),
+        .ram_write(sq.push),
+        .new_ram_data(sq.data_in.offset[1:0]),
+        .ram_data_out(retire_alignment)
+    );
+    //Compare store addr-hashes against new load addr-hash
+    //ID collisions also handled to prevent overwriting store data
+    always_comb begin // 开始组合逻辑块，根据输入组合计算输出。
+        potential_store_conflict = 0;
+        for (int i = 0; i < CONFIG.SQ_DEPTH; i++) begin // 执行循环或遍历。
+            potential_store_conflict |= {(valid[i] & ~issued_one_hot[i]), addr_hash} == {1'b1, hashes[i]};
+            potential_store_conflict |= {(valid[i] & ~issued_one_hot[i] & ids_valid[i]), sq.data_in.id} == {1'b1, ids[i]};
+        end // 结束语句块。
+    end // 结束语句块。
+    ////////////////////////////////////////////////////
+    //Register-based storage
+    //Address hashes
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        for (int i = 0; i < CONFIG.SQ_DEPTH; i++) begin // 执行循环或遍历。
+            if (new_request_one_hot[i]) begin // 执行条件判断，满足条件时进入对应分支。
+                hashes[i] <= addr_hash;
+                ids[i] <= sq.data_in.id_needed;
+                ids_valid[i] <= CONFIG.INCLUDE_UNIT.FPU & sq.data_in.fp ? |fp_store_forward_wb_group : |store_forward_wb_group;
+            end // 结束语句块。
+        end // 结束语句块。
+    end // 结束语句块。
+    ////////////////////////////////////////////////////
+    //Release Handling
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        if (rst) // 执行条件判断，满足条件时进入对应分支。
+            released_count <= 0;
+        else // 执行否则分支。
+            released_count <= released_count + (LOG2_SQ_DEPTH + 1)'(store_retire.valid) - (LOG2_SQ_DEPTH + 1)'(sq.pop);
+    end // 结束语句块。
+
+    ////////////////////////////////////////////////////
+    //Forwarding and Store Data
+    //Forwarding is only needed from multi-cycle writeback ports
+    //Currently this is the LS port [1] and the MUL/DIV/CSR port [2]
+
+    always_ff @ (posedge clk) begin // 开始时序逻辑块，在时钟边沿更新寄存器。
+        wb_snoop <= wb_packet;
+        fp_wb_snoop <= fp_wb_packet;
+    end // 结束语句块。
+
+    lutram_1w_1r #(.DATA_TYPE(retire_table_t), .DEPTH(MAX_IDS))
+    store_retire_table_lutram (
+        .clk(clk),
+        .waddr(sq.data_in.id),
+        .raddr(store_retire.id),
+        .ram_write(sq.push),
+        .new_ram_data('{
+            id_needed : sq.data_in.id_needed,
+            wb_group : store_forward_wb_group,
+            fp_wb_group : fp_store_forward_wb_group,
+            fp : sq.data_in.fp,
+            sq_index : sq_index
+        }),
+        .ram_data_out(retire_table_out)
+    );
+
+    logic [31:0] wb_data [NUM_OF_FORWARDING_PORTS+1]; // 声明信号、变量或生成变量。
+    logic [FLEN-1:0] fp_wb_data [3]; // 声明信号、变量或生成变量。
+
+    //Data issued with the store can be stored by store-id
+    lutram_1w_1r #(.DATA_TYPE(logic[31:0]), .DEPTH(MAX_IDS))
+    non_forwarded_port (
+        .clk(clk),
+        .waddr(sq.data_in.id),
+        .raddr(store_retire.id),
+        .ram_write(sq.push),
+        .new_ram_data(sq.data_in.data),
+        .ram_data_out(wb_data[0])
+    );
+
+    //Data from wb ports is stored by ID and then accessed by store-id to store-id-needed translation
+    generate // 开始生成块，在编译期展开硬件结构。
+    for (genvar i = 0; i < NUM_OF_FORWARDING_PORTS; i++) begin : lutrams // 执行循环或遍历。
+        lutram_1w_1r #(.DATA_TYPE(logic[31:0]), .DEPTH(MAX_IDS))
+        writeback_port (
+            .clk(clk),
+            .waddr(wb_snoop[i+1].id),
+            .raddr(retire_table_out.id_needed),
+            .ram_write(wb_snoop[i+1].valid),
+            .new_ram_data(wb_snoop[i+1].data),
+            .ram_data_out(wb_data[i+1])
+        );
+    end // 结束语句块。
+    endgenerate // 结束生成块。
+
+    generate // 开始生成块，在编译期展开硬件结构。
+    if (CONFIG.INCLUDE_UNIT.FPU) begin : gen_fp_issue_data_storage // 执行条件判断，满足条件时进入对应分支。
+        //FP data issued with the store and data from the FP writeback ports is saved
+        lutram_1w_1r #(.DATA_TYPE(logic[FLEN-1:0]), .DEPTH(MAX_IDS))
+        fp_non_forwarded_port (
+            .clk(clk),
+            .waddr(sq.data_in.id),
+            .raddr(store_retire.id),
+            .ram_write(sq.push),
+            .new_ram_data(sq.data_in.fp_data),
+            .ram_data_out(fp_wb_data[0])
+        );
+    end // 结束语句块。
+    for (genvar i = 0; i < 2; i++) begin : gen_fp_wb_data_storage // 执行循环或遍历。
+        lutram_1w_1r #(.DATA_TYPE(logic[FLEN-1:0]), .DEPTH(MAX_IDS))
+        writeback_port (
+            .clk(clk),
+            .waddr(fp_wb_snoop[i].id),
+            .raddr(retire_table_out.id_needed),
+            .ram_write(fp_wb_snoop[i].valid),
+            .new_ram_data(fp_wb_snoop[i].data),
+            .ram_data_out(fp_wb_data[i+1])
+        );
+    end // 结束语句块。
+    endgenerate // 结束生成块。
+
+    ////////////////////////////////////////////////////
+    //Data Marshalling 
+    assign fp_marshalled_data = fp_wb_data[retire_table_out.fp_wb_group]; // 执行连续赋值，把组合逻辑连接到目标信号。
+    assign data_pre_alignment = wb_data[retire_table_out.wb_group]; // 执行连续赋值，把组合逻辑连接到目标信号。
+    always_comb begin // 开始组合逻辑块，根据输入组合计算输出。
+        //Input: ABCD
+        //Assuming aligned requests,
+        //Possible byte selections: (A/C/D, B/D, C/D, D)
+        marshalled_data[7:0] = data_pre_alignment[7:0];
+        marshalled_data[15:8] = (retire_alignment[1:0] == 2'b01) ? data_pre_alignment[7:0] : data_pre_alignment[15:8];
+        marshalled_data[23:16] = (retire_alignment[1:0] == 2'b10) ? data_pre_alignment[7:0] : data_pre_alignment[23:16];
+        case(retire_alignment[1:0]) // 开始多分支选择，根据表达式选择对应分支。
+            2'b10 : marshalled_data[31:24] = data_pre_alignment[15:8];
+            2'b11 : marshalled_data[31:24] = data_pre_alignment[7:0];
+            default : marshalled_data[31:24] = data_pre_alignment[31:24]; // 执行默认分支。
+        endcase // 结束多分支选择。
+    end // 结束语句块。
+
+
+    //Final storage table for the store queue (includes FP data)
+    //SQ-index addressed
+    generate // 开始生成块，在编译期展开硬件结构。
+    if (CONFIG.INCLUDE_UNIT.FPU && FLEN > 32) begin : gen_upper_always_fp // 执行条件判断，满足条件时进入对应分支。
+        assign sq_data_in[FLEN-1:32] = fp_marshalled_data[FLEN-1:32]; // 执行连续赋值，把组合逻辑连接到目标信号。
+        assign sq_data_in[31:0] = retire_table_out.fp ? fp_marshalled_data[31:0] : marshalled_data[31:0]; // 执行连续赋值，把组合逻辑连接到目标信号。
+    end else if (CONFIG.INCLUDE_UNIT.FPU && FLEN == 32) begin : gen_no_upper // 结束语句块。
+        assign sq_data_in = retire_table_out.fp ? fp_marshalled_data : marshalled_data; // 执行连续赋值，把组合逻辑连接到目标信号。
+    end else if (CONFIG.INCLUDE_UNIT.FPU && FLEN < 32) begin : gen_upper_always_int // 结束语句块。
+        assign sq_data_in[31:FLEN] = marshalled_data[31:FLEN]; // 执行连续赋值，把组合逻辑连接到目标信号。
+        assign sq_data_in[FLEN-1:0] = retire_table_out.fp ? fp_marshalled_data[FLEN-1:0] : marshalled_data[FLEN-1:0]; // 执行连续赋值，把组合逻辑连接到目标信号。
+    end else begin : gen_no_fpu // 结束语句块。
+        assign sq_data_in = marshalled_data; // 执行连续赋值，把组合逻辑连接到目标信号。
+    end // 结束语句块。
+    endgenerate // 结束生成块。
+
+    lutram_1w_1r #(.DATA_TYPE(logic[FINAL_TABLE_WIDTH-1:0]), .DEPTH(CONFIG.SQ_DEPTH))
+    sq_data_lutram (
+        .clk(clk),
+        .waddr(retire_table_out.sq_index),
+        .raddr(sq_oldest),
+        .ram_write(store_retire.valid),
+        .new_ram_data(sq_data_in),
+        .ram_data_out(sq_data_out)
+    );
+
+    assign sq.valid = |released_count; // 执行连续赋值，把组合逻辑连接到目标信号。
+    assign sq.data_out = '{ // 执行连续赋值，把组合逻辑连接到目标信号。
+        offset : output_entry_r.offset,
+        be : output_entry_r.be,
+        cache_op : output_entry_r.cache_op,
+        data : sq_data_out[31:0],
+        fp : output_entry_r.fp,
+        double : output_entry_r.double,
+        fp_data : FLEN'(sq_data_out[(CONFIG.INCLUDE_UNIT.FPU ? FLEN : 32)-1:0])
+    };
+
+    ////////////////////////////////////////////////////
+    //End of Implementation
+    ////////////////////////////////////////////////////
+
+    ////////////////////////////////////////////////////
+    //Assertions
+    sq_overflow_assertion:
+        assert property (@(posedge clk) disable iff (rst) sq.push |-> (~sq.full | sq.pop)) else $error("sq overflow"); // 定义或检查断言、假设、覆盖或时序性质。
+    fifo_underflow_assertion:
+        assert property (@(posedge clk) disable iff (rst) sq.pop |-> sq.valid) else $error("sq underflow"); // 定义或检查断言、假设、覆盖或时序性质。
+
+
+endmodule // 结束模块定义。
