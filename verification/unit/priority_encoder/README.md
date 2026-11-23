@@ -57,33 +57,34 @@ vcs -full64 -sverilog -debug_access+all \
   -o simv
 ./simv
 
-cd /mnt/e/ic/cva5-master-annotated-20261107/verification/unit/tb_ram/tb_lutram_1w_mr
+cd /mnt/e/ic/cva5-master-annotated-20261107/verification/unit/tb_ram/tb_sdp_ram
 
 vcs -full64 -sverilog -timescale=1ns/1ps \
     -debug_access+all -kdb \
     -cm line+cond+tgl+branch+fsm+assert \
     -cm_dir ./simv.vdb \
     -top tb_lutram_1w_1r \
-    ../../../../core/common_components/ram/lutram_1w_mr.sv \
-    tb_lutram_1w_mr.sv \
+    ../../../../core/common_components/ram/sdp_ram.sv \
+    tb_sdp_ram.sv \
     -o simv
 
 ./simv > sim.log 2>&1
 grep -c "Match:" sim.log
+cd /mnt/e/ic/cva5-master-annotated-20261107/verification/unit/tb_ram/tb_tdp_ram
 
 vcs -full64 -sverilog -debug_access+all \
   -timescale=1ns/1ps \
   -cm line+cond+fsm+tgl+branch+assert \
   -cm_dir ./simv.vdb \
-  -top tb_lutram_1w_mr_top \
+  -top tb_tdp_ram_top \
   ../../../../core/types_and_interfaces/cva5_config.sv \
   ../../../../core/types_and_interfaces/riscv_types.sv \
   ../../../../core/types_and_interfaces/csr_types.sv \
   ../../../../core/types_and_interfaces/cva5_types.sv \
   ../../../../core/types_and_interfaces/fpu_types.sv \
   ../../../../core/types_and_interfaces/opcodes.sv \
-  ../../../../core/common_components/ram/lutram_1w_mr.sv \
-  tb_lutram_1w_mr.sv \
+  ../../../../core/common_components/ram/tdp_ram.sv \
+  tb_tdp_ram.sv \
   -o simv
 
 ./simv \
